@@ -76,25 +76,30 @@ class MLP(nn.Module):
 
 
 class social_transformer(nn.Module):
-    def __init__(self, past_len):
+    def __init__(self, t_h=10, d_h=6): # model_diffusion.py 기준 파라미터
         super(social_transformer, self).__init__()
-        self.encode_past = nn.Linear(past_len * 6, 256, bias=False)
-        # batch_first=True를 통해 성능을 최적화합니다.
-        self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=2, dim_feedforward=256, batch_first=True)
+        self.nhead = 2
+        self.encode_past = nn.Linear(t_h * d_h, 256, bias=False)
+        # batch_first=True 설정으로 Flash Attention 활성화
+        self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=self.nhead, dim_feedforward=256, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(self.layer, num_layers=2)
 
     def forward(self, h, mask):
-        # h: (B*N, T_H, 6) -> 특징 추출 후 (B*N, 256)
+        # 1. 특징 추출 (B*N, 256)
         h_feat = self.encode_past(h.reshape(h.size(0), -1))
         
-        # B 차원을 복원하여 (B, N, 256) 시퀀스로 변환
-        B = mask.size(0)
-        h_seq = h_feat.view(B, -1, 256) 
+        # 2. B(배치)와 N(노드 수 9) 차원 복원
+        # mask가 2D(9, 9)면 h.size(0) // 9를 통해 B=512를 계산합니다.
+        N = 9 
+        B = h.size(0) // N
+        h_seq = h_feat.view(B, N, 256) # (512, 9, 256)
         
-        # (B, N, N) 마스크와 함께 Transformer 연산 수행
+        # 3. 3D 마스크가 들어올 경우를 대비한 안전 장치 (헤드 수만큼 확장)
+        if mask is not None and mask.dim() == 3:
+            mask = mask.repeat_interleave(self.nhead, dim=0)
+        
+        # 4. Transformer 연산 및 결과 리턴 (B*N, 1, 256)
         h_feat_seq = self.transformer_encoder(h_seq, mask)
-        
-        # 결과값 리턴: (B*N, 1, 256)
         return (h_seq + h_feat_seq).reshape(-1, 256).unsqueeze(1)
 
 

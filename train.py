@@ -63,24 +63,20 @@ def get_dataloader(cfg, split='train'):
 
 
 def data_preprocess(batch, device, cfg):
-    """
-    전처리된 데이터를 모델 입력 규격으로 변환합니다.
-    """
-    num_node = cfg['model']['num_node'] # 9 (ego + 8 neighbors)
+    past_traj = batch['past_traj'].to(device)     # (B, 9, T_H, 6)
+    fut_traj = batch['fut_traj'].to(device)       # (B, T_F, 2)
+    initial_pos = batch['initial_pos'].to(device) # (B, 2)
+    
+    B = past_traj.shape[0] # 512
+    N = past_traj.shape[1] # 9
     T_H = cfg['data']['history_frames']
 
-    # 1. 데이터를 GPU로 전송
-    past_traj = batch['past_traj'].to(device)   # (B, 9, T_H, 6)
-    fut_traj = batch['fut_traj'].to(device)     # (B, T_F, 2)
-    initial_pos = batch['initial_pos'].to(device) # (B, 2)
-    B = past_traj.shape[0]
+    # 1. 모델 입력을 위해 (B*N, T_H, 6) 형태로 변환
+    past_traj_flat = past_traj.reshape(-1, T_H, 6)
 
-    # 2. 모델 입력을 위해 (B*N, T_H, 6) 형태로 펼침
-    past_traj_flat = past_traj.reshape(B * num_node, T_H, 6)
-
-    # 3. Social Transformer를 위한 (B, N, N) 마스크 생성
-    # batch_first=True 설정에 따라 (Batch, Seq, Seq) 형태를 가집니다.
-    traj_mask = torch.ones((B, num_node, num_node), device=device)
+    # 2. [핵심] 2D 마스크 사용: (9, 9) 크기로 생성하면 모든 헤드/배치에 자동 적용됩니다.
+    # 3D 마스크 규격 에러를 원천 차단하고 연산량을 줄입니다.
+    traj_mask = torch.ones((N, N), device=device) 
 
     return B, traj_mask, past_traj_flat, fut_traj, initial_pos
 

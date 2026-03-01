@@ -7,30 +7,31 @@ from models.layers import PositionalEncoding, ConcatSquashLinear
 
 
 class social_transformer(nn.Module):
-	def __init__(self, t_h=10, d_h=6):
-		super(social_transformer, self).__init__()
-		self.encode_past = nn.Linear(t_h * d_h, 256, bias=False)
-		self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=2, dim_feedforward=256, batch_first=True)
-		self.transformer_encoder = nn.TransformerEncoder(self.layer, num_layers=2)
+    def __init__(self, t_h=10, d_h=6): # model_diffusion.py 기준 파라미터
+        super(social_transformer, self).__init__()
+        self.nhead = 2
+        self.encode_past = nn.Linear(t_h * d_h, 256, bias=False)
+        # batch_first=True 설정으로 Flash Attention 활성화
+        self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=self.nhead, dim_feedforward=256, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(self.layer, num_layers=2)
 
-	def forward(self, h, mask):
-		'''
-		h: (B*N, T_H, d_h)
-		mask: (B, N, N)
-		'''
-		# 1. 특징 추출 (B*N, 256)
-		h_feat = self.encode_past(h.reshape(h.size(0), -1))
-		
-		# 2. [수정] B(배치)와 N(노드 수)을 복원하여 시퀀스 형태로 변환
-		# batch_first=True이므로 (B, N, 256)이 됩니다.
-		B = mask.size(0)
-		h_seq = h_feat.view(B, -1, 256) 
-		
-		# 3. Transformer 적용 (B, N, N) 마스크와 (B, N, 256) 데이터 연산
-		h_feat_seq = self.transformer_encoder(h_seq, mask)
-		
-		# 4. 결과 리턴: 잔차 연결 후 다시 (B*N, 1, 256)으로 펼침
-		return (h_seq + h_feat_seq).reshape(-1, 256).unsqueeze(1)
+    def forward(self, h, mask):
+        # 1. 특징 추출 (B*N, 256)
+        h_feat = self.encode_past(h.reshape(h.size(0), -1))
+        
+        # 2. B(배치)와 N(노드 수 9) 차원 복원
+        # mask가 2D(9, 9)면 h.size(0) // 9를 통해 B=512를 계산합니다.
+        N = 9 
+        B = h.size(0) // N
+        h_seq = h_feat.view(B, N, 256) # (512, 9, 256)
+        
+        # 3. 3D 마스크가 들어올 경우를 대비한 안전 장치 (헤드 수만큼 확장)
+        if mask is not None and mask.dim() == 3:
+            mask = mask.repeat_interleave(self.nhead, dim=0)
+        
+        # 4. Transformer 연산 및 결과 리턴 (B*N, 1, 256)
+        h_feat_seq = self.transformer_encoder(h_seq, mask)
+        return (h_seq + h_feat_seq).reshape(-1, 256).unsqueeze(1)
 
 
 class TransformerDenoisingModel(Module):
