@@ -371,7 +371,7 @@ def main():
 
     count_parameters(model_initializer, model_denoiser)
 
-    if hasattr(torch, 'compile'):
+    if cfg.get('compile', False) and hasattr(torch, 'compile'):
         model_initializer = torch.compile(model_initializer)
         model_denoiser    = torch.compile(model_denoiser)
 
