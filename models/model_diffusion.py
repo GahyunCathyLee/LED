@@ -10,7 +10,7 @@ class social_transformer(nn.Module):
 	def __init__(self, t_h=10, d_h=6):
 		super(social_transformer, self).__init__()
 		self.encode_past = nn.Linear(t_h * d_h, 256, bias=False)
-		self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=2, dim_feedforward=256)
+		self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=2, dim_feedforward=256, batch_first=True)
 		self.transformer_encoder = nn.TransformerEncoder(self.layer, num_layers=2)
 
 	def forward(self, h, mask):
