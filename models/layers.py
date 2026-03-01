@@ -16,11 +16,11 @@ class PositionalEncoding(nn.Module):
 		)
 		pe[:, 0::2] = torch.sin(position * div_term)
 		pe[:, 1::2] = torch.cos(position * div_term)
-		pe = pe.unsqueeze(0).transpose(0, 1)
+		pe = pe.unsqueeze(0)
 		self.register_buffer("pe", pe)
 
 	def forward(self, x):
-		x = x + self.pe[: x.size(0), :]
+		x = x + self.pe[:, : x.size(1), :]
 		return self.dropout(x)
 
 
@@ -79,19 +79,14 @@ class social_transformer(nn.Module):
 	def __init__(self, past_len):
 		super(social_transformer, self).__init__()
 		self.encode_past = nn.Linear(past_len*6, 256, bias=False)
-		self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=2, dim_feedforward=256)
+		self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=2, dim_feedforward=256, batch_first=True)
 		self.transformer_encoder = nn.TransformerEncoder(self.layer, num_layers=2)
 
 	def forward(self, h, mask):
-		'''
-		h: batch_size, t, 2
-		'''
-		h_feat = self.encode_past(h.reshape(h.size(0), -1)).unsqueeze(1)
-		# print(h_feat.shape)
-		# n_samples, 1, 64
-		h_feat_ = self.transformer_encoder(h_feat, mask)
-		h_feat = h_feat + h_feat_
-
+		h_feat = self.encode_past(h.reshape(h.size(0), -1))
+		h_seq = h_feat.unsqueeze(0)
+		h_feat_seq = self.transformer_encoder(h_seq, mask)
+		h_feat = (h_seq + h_feat_seq).transpose(0, 1)
 		return h_feat
 
 

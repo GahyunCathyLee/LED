@@ -243,9 +243,10 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
         loc = sample_pred + mean_est[:, None]   # (B*num_node, K, T_F, 2)
 
         # ── Accelerated diffusion sampling ────────────────────────────────────
-        generated_y = _p_sample_loop_accelerate(
-            model_denoiser, diffusion, past_traj, traj_mask, loc
-        )  # (B*num_node, K, T_F, 2)
+        with torch.no_grad(): # Denoiser 샘플링 시 gradient 계산 차단
+            generated_y = _p_sample_loop_accelerate(
+                model_denoiser, diffusion, past_traj, traj_mask, loc
+            )
 
         # ── Ego-only predictions ──────────────────────────────────────────────
         ego_gen = generated_y[ego_idx]             # (B, K, T_F, 2)
@@ -371,7 +372,7 @@ def main():
 
     count_parameters(model_initializer, model_denoiser)
 
-    if cfg.get('compile', False) and hasattr(torch, 'compile'):
+    if cfg.get('compile', True) and hasattr(torch, 'compile'):
         model_initializer = torch.compile(model_initializer)
         model_denoiser    = torch.compile(model_denoiser)
 

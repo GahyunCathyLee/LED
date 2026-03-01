@@ -31,7 +31,7 @@ class TransformerDenoisingModel(Module):
 		self.encoder_context = social_transformer(t_h=t_h, d_h=d_h)
 		self.pos_emb = PositionalEncoding(d_model=2*context_dim, dropout=0.1, max_len=100)
 		self.concat1 = ConcatSquashLinear(2, 2*context_dim, context_dim+3)
-		self.layer = nn.TransformerEncoderLayer(d_model=2*context_dim, nhead=2, dim_feedforward=2*context_dim)
+		self.layer = nn.TransformerEncoderLayer(d_model=2*context_dim, nhead=2, dim_feedforward=2*context_dim, batch_first=True)
 		self.transformer_encoder = nn.TransformerEncoder(self.layer, num_layers=tf_layer)
 		self.concat3 = ConcatSquashLinear(2*context_dim,context_dim,context_dim+3)
 		self.concat4 = ConcatSquashLinear(context_dim,context_dim//2,context_dim+3)
@@ -49,10 +49,9 @@ class TransformerDenoisingModel(Module):
 		ctx_emb = torch.cat([time_emb, context], dim=-1)    # (B, 1, F+3)
 		
 		x = self.concat1(ctx_emb, x)
-		final_emb = x.permute(1,0,2)
-		final_emb = self.pos_emb(final_emb)
-		
-		trans = self.transformer_encoder(final_emb).permute(1,0,2)
+		x = self.pos_emb(x)
+
+		trans = self.transformer_encoder(x)
 		trans = self.concat3(ctx_emb, trans)
 		trans = self.concat4(ctx_emb, trans)
 		return self.linear(ctx_emb, trans)
@@ -71,12 +70,12 @@ class TransformerDenoisingModel(Module):
 		ctx_emb  = torch.cat([time_emb, context], dim=-1).repeat(1, n_samples, 1).unsqueeze(2)
 		# ctx_emb: (B*N, n_samples, 1, 259)
 
-		x = self.concat1.batch_generate(ctx_emb, x).contiguous().view(-1, t_f, 512)
-		# (B*N * n_samples, T_F, 512)
-		final_emb = x.permute(1, 0, 2)
-		final_emb = self.pos_emb(final_emb)
+		x = self.concat1.batch_generate(ctx_emb, x)
+		x_flat = x.view(-1, t_f, 512)
+		final_emb = self.pos_emb(x_flat)
 
-		trans = self.transformer_encoder(final_emb).permute(1, 0, 2).contiguous().view(-1, n_samples, t_f, 512)
+		trans_flat = self.transformer_encoder(final_emb)
+		trans = trans_flat.view(-1, n_samples, t_f, 512)
 		# (B*N, n_samples, T_F, 512)
 		trans = self.concat3.batch_generate(ctx_emb, trans)
 		trans = self.concat4.batch_generate(ctx_emb, trans)
