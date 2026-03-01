@@ -9,10 +9,8 @@ import torch.nn as nn
 from utils.config import Config
 from utils.utils import print_log
 
-
 from torch.utils.data import DataLoader
-from data.dataloader_nba import NBADataset, seq_collate
-
+from data.dataloader_highd import HighDDataset, seq_collate
 
 from models.model_led_initializer import LEDInitializer as InitializationModel
 from models.model_diffusion import TransformerDenoisingModel as CoreDenoisingModel
