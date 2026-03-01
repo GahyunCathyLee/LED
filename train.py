@@ -64,60 +64,25 @@ def get_dataloader(cfg, split='train'):
 
 def data_preprocess(batch, device, cfg):
     """
-    Convert HighDDataset batch → LED model inputs.
-
-    Input shapes (from HighDDataset):
-        ego_past  : (B, T_H, 2)          absolute x, y
-        nbr_past  : (B, 8, T_H, D_nbr)   relative neighbor features
-        target    : (B, T_F, 2)           absolute future x, y
-
-    Returns
-    -------
-    B           : int
-    traj_mask   : (B * num_node, B * num_node)   block-diagonal
-    past_traj   : (B * num_node, T_H, 6)         6-dim augmented features
-    fut_traj    : (B, T_F, 2)                     ego-only, relative to last obs
-    initial_pos : (B, 1, 2)                       last observed ego position
+    전처리된 데이터를 모델 입력 규격으로 변환합니다.
     """
-    num_node = cfg['model']['num_node']   # 9  (ego + 8 neighbors)
-    T_H      = cfg['data']['history_frames']
+    num_node = cfg['model']['num_node'] # 9 (ego + 8 neighbors)
+    T_H = cfg['data']['history_frames']
 
-    ego_past = batch['ego_past'].to(device)   # (B, T_H, 2)
-    nbr_past = batch['nbr_past'].to(device)   # (B, 8, T_H, D_nbr)
-    target   = batch['target'].to(device)     # (B, T_F, 2)
-    B = ego_past.shape[0]
+    # 1. 데이터를 GPU로 전송
+    past_traj = batch['past_traj'].to(device)   # (B, 9, T_H, 6)
+    fut_traj = batch['fut_traj'].to(device)     # (B, T_F, 2)
+    initial_pos = batch['initial_pos'].to(device) # (B, 2)
+    B = past_traj.shape[0]
 
-    # ── Ego feature augmentation: rel-pos + vel + acc  →  6-dim ──────────────
-    initial_pos = ego_past[:, -1:, :]                        # (B, 1, 2)
-    ego_rel     = ego_past - initial_pos                      # (B, T_H, 2)
-    ego_vel     = torch.zeros_like(ego_rel)
-    ego_vel[:, :-1] = ego_rel[:, 1:] - ego_rel[:, :-1]      # forward diff
-    ego_acc     = torch.zeros_like(ego_vel)
-    ego_acc[:, :-1] = ego_vel[:, 1:] - ego_vel[:, :-1]
-    ego_feat = torch.cat([ego_rel, ego_vel, ego_acc], dim=-1)  # (B, T_H, 6)
+    # 2. 모델 입력을 위해 (B*N, T_H, 6) 형태로 펼침
+    past_traj_flat = past_traj.reshape(B * num_node, T_H, 6)
 
-    # ── Neighbor features: pad / truncate to 6-dim ───────────────────────────
-    D_nbr = nbr_past.shape[-1]
-    if D_nbr < 6:
-        pad      = torch.zeros(B, 8, T_H, 6 - D_nbr, device=device)
-        nbr_feat = torch.cat([nbr_past, pad], dim=-1)          # (B, 8, T_H, 6)
-    else:
-        nbr_feat = nbr_past[..., :6]                           # (B, 8, T_H, 6)
+    # 3. Social Transformer를 위한 (B, N, N) 마스크 생성
+    # batch_first=True 설정에 따라 (Batch, Seq, Seq) 형태를 가집니다.
+    traj_mask = torch.ones((B, num_node, num_node), device=device)
 
-    # ── Stack ego + neighbors  →  (B * num_node, T_H, 6) ────────────────────
-    all_feat  = torch.cat([ego_feat.unsqueeze(1), nbr_feat], dim=1)  # (B, 9, T_H, 6)
-    past_traj = all_feat.reshape(B * num_node, T_H, 6)
-
-    # ── Block-diagonal social mask ────────────────────────────────────────────
-    traj_mask = torch.kron(
-        torch.eye(B, device=device),
-        torch.ones(num_node, num_node, device=device),
-    )
-
-    # ── Future trajectory: ego only, relative to last observed position ───────
-    fut_traj = target - initial_pos   # (B, T_F, 2)
-
-    return B, traj_mask, past_traj, fut_traj, initial_pos
+    return B, traj_mask, past_traj_flat, fut_traj, initial_pos
 
 
 # ==============================================================================
@@ -180,16 +145,13 @@ def _p_sample_accelerate(model_denoiser, diffusion, x, mask, cur_y, t):
 
 def _p_sample_loop_accelerate(model_denoiser, diffusion, x, mask, loc):
     """
-    Batch-parallel accelerated sampling over K=20 predictions.
-    loc: (B*num_node, K=20, T_F, 2)
+    20개의 예측 샘플 전체를 한 번에 병렬로 샘플링하여 속도를 높입니다.
     """
-    cur_y  = loc[:, :10]
+    cur_y = loc[:, :20] # 20개 전체 선택
     for i in reversed(range(NUM_TAU)):
-        cur_y  = _p_sample_accelerate(model_denoiser, diffusion, x, mask, cur_y,  i)
-    cur_y_ = loc[:, 10:]
-    for i in reversed(range(NUM_TAU)):
-        cur_y_ = _p_sample_accelerate(model_denoiser, diffusion, x, mask, cur_y_, i)
-    return torch.cat((cur_y_, cur_y), dim=1)   # (B*num_node, K=20, T_F, 2)
+        # model_denoiser 내부의 generate_accelerate가 20개를 한 번에 처리합니다.
+        cur_y = _p_sample_accelerate(model_denoiser, diffusion, x, mask, cur_y, i)
+    return cur_y
 
 
 # ==============================================================================

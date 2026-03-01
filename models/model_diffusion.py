@@ -15,13 +15,22 @@ class social_transformer(nn.Module):
 
 	def forward(self, h, mask):
 		'''
-		h: batch_size, T_H, d_h
+		h: (B*N, T_H, d_h)
+		mask: (B, N, N)
 		'''
-		h_feat = self.encode_past(h.reshape(h.size(0), -1)).unsqueeze(1)
-		h_feat_ = self.transformer_encoder(h_feat, mask)
-		h_feat = h_feat + h_feat_
-
-		return h_feat
+		# 1. 특징 추출 (B*N, 256)
+		h_feat = self.encode_past(h.reshape(h.size(0), -1))
+		
+		# 2. [수정] B(배치)와 N(노드 수)을 복원하여 시퀀스 형태로 변환
+		# batch_first=True이므로 (B, N, 256)이 됩니다.
+		B = mask.size(0)
+		h_seq = h_feat.view(B, -1, 256) 
+		
+		# 3. Transformer 적용 (B, N, N) 마스크와 (B, N, 256) 데이터 연산
+		h_feat_seq = self.transformer_encoder(h_seq, mask)
+		
+		# 4. 결과 리턴: 잔차 연결 후 다시 (B*N, 1, 256)으로 펼침
+		return (h_seq + h_feat_seq).reshape(-1, 256).unsqueeze(1)
 
 
 class TransformerDenoisingModel(Module):

@@ -76,18 +76,26 @@ class MLP(nn.Module):
 
 
 class social_transformer(nn.Module):
-	def __init__(self, past_len):
-		super(social_transformer, self).__init__()
-		self.encode_past = nn.Linear(past_len*6, 256, bias=False)
-		self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=2, dim_feedforward=256, batch_first=True)
-		self.transformer_encoder = nn.TransformerEncoder(self.layer, num_layers=2)
+    def __init__(self, past_len):
+        super(social_transformer, self).__init__()
+        self.encode_past = nn.Linear(past_len * 6, 256, bias=False)
+        # batch_first=True를 통해 성능을 최적화합니다.
+        self.layer = nn.TransformerEncoderLayer(d_model=256, nhead=2, dim_feedforward=256, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(self.layer, num_layers=2)
 
-	def forward(self, h, mask):
-		h_feat = self.encode_past(h.reshape(h.size(0), -1))
-		h_seq = h_feat.unsqueeze(0)
-		h_feat_seq = self.transformer_encoder(h_seq, mask)
-		h_feat = (h_seq + h_feat_seq).transpose(0, 1)
-		return h_feat
+    def forward(self, h, mask):
+        # h: (B*N, T_H, 6) -> 특징 추출 후 (B*N, 256)
+        h_feat = self.encode_past(h.reshape(h.size(0), -1))
+        
+        # B 차원을 복원하여 (B, N, 256) 시퀀스로 변환
+        B = mask.size(0)
+        h_seq = h_feat.view(B, -1, 256) 
+        
+        # (B, N, N) 마스크와 함께 Transformer 연산 수행
+        h_feat_seq = self.transformer_encoder(h_seq, mask)
+        
+        # 결과값 리턴: (B*N, 1, 256)
+        return (h_seq + h_feat_seq).reshape(-1, 256).unsqueeze(1)
 
 
 class st_encoder(nn.Module):

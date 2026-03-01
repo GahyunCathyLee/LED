@@ -108,43 +108,58 @@ def process_recording(rec_id, raw_dir, args):
     stride = int(round(raw_fps / TARGET_HZ))
     df = df[df["frame"] % stride == 0].sort_values(["id", "frame"])
 
-    # 피처 인덱스 설정
-    ego_key, nbr_key = EXPERIMENT_MODE_MAP[args.experiment_mode]
-    ego_idxs = EGO_FT[ego_key]
-    nbr_idxs = NBR_FT[nbr_key]
+    # [추가] agents 딕셔너리 생성: ID별 데이터 고속 조회용
+    agents = {
+        vid: g[["frame", "x", "y", "xVelocity", "yVelocity", "xAcceleration", "yAcceleration"]].values 
+        for vid, g in df.groupby("id")
+    }
     
     samples = []
-    agents = {vid: g[["frame", "x", "y", "xVelocity", "yVelocity", "xAcceleration", "yAcceleration"]].values 
-              for vid, g in df.groupby("id")}
-    
     for vid, data in agents.items():
         if len(data) < T_H + T_F: continue
+        
+        # TARGET_HZ 간격으로 샘플링하여 중복 데이터 감소 및 학습 속도 향상
         for i in range(0, len(data) - (T_H + T_F) + 1, int(TARGET_HZ)):
             window = data[i : i + T_H + T_F]
             ego_hist = window[:T_H]
+            # 마지막 관측 시점의 x, y 좌표 (기준점)
+            initial_pos = ego_hist[-1, 1:3].copy() 
+
+            # 1. Ego 특징 (6차원: 상대 x, y, vx, vy, ax, ay)
+            ego_feat = np.zeros((T_H, 6), dtype=np.float32)
+            ego_feat[:, :2] = ego_hist[:, 1:3] - initial_pos
+            ego_feat[:, 2:4] = ego_hist[:, 3:5]
+            ego_feat[:, 4:6] = ego_hist[:, 5:7]
+
+            # 2. Neighbor 특징 (Ego 포함 9개 노드 전체: 9, T_H, 6)
+            all_past = np.zeros((MAX_NEIGHBORS + 1, T_H, 6), dtype=np.float32)
+            all_past[0] = ego_feat 
+
+            # 관측 시점(obs_fr)의 주변 차량 ID 조회
             obs_fr = ego_hist[-1, 0]
-            
-            # Neighbor ID 조회
             nbr_ids = df[(df["id"] == vid) & (df["frame"] == obs_fr)][NEIGHBOR_COLS].values.flatten()
             
-            # Tensors: LED Input Format [cite: 92, 108]
-            # ego_in: (T_H, D_ego), nbr_in: (8, T_H, D_nbr)
-            ego_tensor = ego_hist[:, 1:][:, ego_idxs]
-            nbr_tensor = np.zeros((MAX_NEIGHBORS, T_H, len(nbr_idxs)), dtype=np.float32)
-            
             for nb_idx, nb_id in enumerate(nbr_ids):
+                if nb_idx >= MAX_NEIGHBORS: break
                 if nb_id <= 0 or nb_id not in agents: continue
+                
                 nb_data = agents[nb_id]
+                # Ego와 동일한 프레임의 데이터만 추출
                 nb_win = nb_data[np.isin(nb_data[:, 0], ego_hist[:, 0])]
                 if len(nb_win) < T_H: continue
                 
-                all_feats = get_neighbor_features(ego_hist, nb_win, args)
-                nbr_tensor[nb_idx, :, :] = all_feats[:, nbr_idxs]
-            
+                # 상대 피처 계산하여 슬롯(1~8)에 저장
+                all_past[nb_idx + 1, :, 0:2] = nb_win[:, 1:3] - initial_pos
+                all_past[nb_idx + 1, :, 2:4] = nb_win[:, 3:5]
+                all_past[nb_idx + 1, :, 4:6] = nb_win[:, 5:7]
+
+            # 3. 미래 경로 (Ego의 마지막 관측 위치 기준 상대 좌표)
+            fut_rel = window[T_H:, 1:3] - initial_pos
+
             samples.append({
-                "ego_past": ego_tensor.astype(np.float32),
-                "nbr_past": nbr_tensor.astype(np.float32),
-                "target": window[T_H:, 1:3].astype(np.float32) # (T_F, 2) x,y
+                "past_traj": all_past,      # (9, T_H, 6)
+                "fut_traj": fut_rel,        # (T_F, 2)
+                "initial_pos": initial_pos   # (2,)
             })
     return samples
 
