@@ -327,6 +327,7 @@ def main():
     seed_everything(cfg['exp']['seed'])
     device = torch.device(cfg['exp']['device'] if torch.cuda.is_available() else 'cpu')
     torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
 
     feature_mode = cfg['exp']['feature_mode']
     T_H = cfg['data']['history_frames']

@@ -11,7 +11,7 @@ exp:
 # =========================
 data:
   base_dir: 'highD'          # npz files at highD/<feature_mode>/{train,val,test}.npz
-  batch_size: 512
+  batch_size: 64
   num_workers: 4
   persistent_workers: True
   history_frames: 15         # T_H = 3.0s @ 5Hz
