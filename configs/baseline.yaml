@@ -1,0 +1,43 @@
+# =========================
+# EXPERIMENT SETTING
+# =========================
+exp:
+  feature_mode: 'baseline'   # highD/preprocess.py EXPERIMENT_MODE_MAP key
+  device: 'cuda:0'
+  seed: 42
+
+# =========================
+# DATA PATHS & PARAMS
+# =========================
+data:
+  base_dir: 'highD'          # npz files at highD/<feature_mode>/{train,val,test}.npz
+  batch_size: 512
+  num_workers: 4
+  persistent_workers: True
+  history_frames: 15         # T_H = 3.0s @ 5Hz
+  future_frames: 25          # T_F = 5.0s @ 5Hz
+
+# =========================
+# MODEL PARAMS
+# =========================
+model:
+  num_node: 9                # 1 ego + 8 neighbors
+
+# =========================
+# TRAINING PARAMS
+# =========================
+train:
+  epochs: 300
+  lr: 0.0001
+  lr_min: 0.000001        # CosineAnnealingLR eta_min
+  weight_decay: 0.0001
+  ckpt_dir: 'ckpts'
+
+# =========================
+# DIFFUSION PARAMS
+# =========================
+diffusion:
+  steps: 100
+  beta_schedule: 'linear'
+  beta_start: 0.00001
+  beta_end: 0.02

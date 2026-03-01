@@ -54,41 +54,6 @@ class ConcatSquashLinear(Module):
 		return ret
 	
 
-class GAT(nn.Module):
-	def __init__(self, in_feat=2, out_feat=64, n_head=4, dropout=0.1, skip=True):
-		super(GAT, self).__init__()
-		self.in_feat = in_feat
-		self.out_feat = out_feat
-		self.n_head = n_head
-		self.skip = skip
-		self.w = nn.Parameter(torch.Tensor(n_head, in_feat, out_feat))
-		self.a_src = nn.Parameter(torch.Tensor(n_head, out_feat, 1))
-		self.a_dst = nn.Parameter(torch.Tensor(n_head, out_feat, 1))
-		self.bias = nn.Parameter(torch.Tensor(out_feat))
-
-		self.leaky_relu = nn.LeakyReLU(negative_slope=0.2)
-		self.softmax = nn.Softmax(dim=-1)
-		self.dropout = nn.Dropout(dropout)
-
-		nn.init.xavier_uniform_(self.w, gain=1.414)
-		nn.init.xavier_uniform_(self.a_src, gain=1.414)
-		nn.init.xavier_uniform_(self.a_dst, gain=1.414)
-		nn.init.constant_(self.bias, 0)
-
-	def forward(self, h, mask):
-		h_prime = h.unsqueeze(1) @ self.w
-		attn_src = h_prime @ self.a_src
-		attn_dst = h_prime @ self.a_dst
-		attn = attn_src @ attn_dst.permute(0, 1, 3, 2)
-		attn = self.leaky_relu(attn)
-		attn = self.softmax(attn)
-		attn = self.dropout(attn)
-		attn = attn * mask if mask is not None else attn
-		out = (attn @ h_prime).sum(dim=1) + self.bias
-		if self.skip:
-			out += h_prime.sum(dim=1)
-		return out, attn
-
 
 class MLP(nn.Module):
 	def __init__(self, in_feat, out_feat, hid_feat=(1024, 512), activation=None, dropout=-1):
