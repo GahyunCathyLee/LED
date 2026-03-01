@@ -213,9 +213,9 @@ def main():
         # LED 모델에서 부르기 편하게 .npz로 묶어 저장 (또는 개별 .npy)
         np.savez_compressed(
             mode_dir / f"{split_name}.npz",
-            ego_past=np.array([s["ego_past"] for s in split_data]),
-            nbr_past=np.array([s["nbr_past"] for s in split_data]),
-            target=np.array([s["target"] for s in split_data])
+            past_traj=np.array([s["past_traj"] for s in split_data]),
+            fut_traj=np.array([s["fut_traj"] for s in split_data]),
+            initial_pos=np.array([s["initial_pos"] for s in split_data])
         )
         print(f"Saved {split_name}.npz with {len(split_data)} samples")
 
