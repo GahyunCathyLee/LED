@@ -341,7 +341,11 @@ def main():
     model_initializer = LEDInitializer(t_h=T_H, d_h=6, t_f=T_F, d_f=2, k_pred=20).to(device)
     model_denoiser = TransformerDenoisingModel(t_h=T_H, d_h=6).to(device)
     
-    model_initializer = DDP(model_initializer, device_ids=[local_rank])
+    model_initializer = DDP(
+        model_initializer, 
+        device_ids=[local_rank],
+        find_unused_parameters=True
+    )
 
     # ── Diffusion setup (Stage 1/2 공통) ──────────────────────────────────────
     diffusion = setup_diffusion(cfg, device)
