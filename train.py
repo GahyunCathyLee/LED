@@ -202,43 +202,41 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
         # Ego node indices within the stacked (B*num_node) tensor: 0, 9, 18, ...
         ego_idx = torch.arange(B, device=device) * num_node
 
+        # ── Initializer (BF16 autocast) ──────────────────────────────────────
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-            # ── Initializer ──────────────────────────────────────────────────
             sample_pred, mean_est, var_est = model_initializer(past_traj, traj_mask)
             # sample_pred : (B*num_node, K=20, T_F, 2)
             # mean_est    : (B*num_node, T_F, 2)
             # var_est     : (B*num_node, 1)
-
             sample_pred = (
                 torch.exp(var_est / 2)[..., None, None] * sample_pred
                 / sample_pred.std(dim=1).mean(dim=(1, 2))[:, None, None, None]
             )
             loc = sample_pred + mean_est[:, None]   # (B*num_node, K, T_F, 2)
 
-            # ── Accelerated diffusion sampling (frozen denoiser) ──────────────
-            with torch.no_grad():
-                generated_y = p_sample_loop_accelerate(
-                    model_denoiser, diffusion, past_traj, traj_mask, loc,
-                    num_tau=cfg.get('diffusion', {}).get('num_tau', 5),
-                )
+        # ── Denoiser inference: frozen → float32 (BF16+head_dim=256 Flash Attn 오류 방지)
+        with torch.no_grad():
+            generated_y = p_sample_loop_accelerate(
+                model_denoiser, diffusion, past_traj, traj_mask, loc.detach().float(),
+                num_tau=cfg.get('diffusion', {}).get('num_tau', 5),
+            )
 
-            # ── Ego-only predictions ──────────────────────────────────────────
-            ego_loc = loc[ego_idx]                     # (B, K, T_F, 2) — gradient 있음
-            ego_gen = generated_y[ego_idx]             # (B, K, T_F, 2) — uncertainty 보정용
-            ego_var = var_est[ego_idx].squeeze(-1)     # (B,)
-            fut_k   = fut_traj.unsqueeze(1)            # (B, 1, T_F, 2)
+        # ── Ego-only predictions & Loss ──────────────────────────────────────
+        ego_loc = loc[ego_idx]                     # (B, K, T_F, 2) — BF16, gradient 있음
+        ego_gen = generated_y[ego_idx]             # (B, K, T_F, 2) — float32, uncertainty 보정용
+        ego_var = var_est[ego_idx].squeeze(-1)     # (B,) — BF16
+        fut_k   = fut_traj.unsqueeze(1)            # (B, 1, T_F, 2)
 
-            # ── Loss ─────────────────────────────────────────────────────────
-            # [버그 수정] ego_loc(loc 기반) 으로 계산해야 model_initializer까지 gradient 전달됨.
-            # ego_gen(generated_y 기반)은 no_grad 내부에서 만들어져 gradient가 없음.
-            loss_dist = (
-                (ego_loc - fut_k).norm(p=2, dim=-1) * temporal_reweight
-            ).mean(dim=-1).min(dim=1)[0].mean()
+        # [버그 수정] ego_loc(loc 기반) 으로 계산해야 model_initializer까지 gradient 전달됨.
+        # ego_gen(generated_y 기반)은 no_grad 내부에서 만들어져 gradient가 없음.
+        loss_dist = (
+            (ego_loc - fut_k).norm(p=2, dim=-1) * temporal_reweight
+        ).mean(dim=-1).min(dim=1)[0].mean()
 
-            norms    = (ego_gen - fut_k).norm(p=2, dim=-1).mean(dim=(1, 2))  # (B,) detached — OK
-            loss_unc = (torch.exp(-ego_var) * norms + ego_var).mean()
+        norms    = (ego_gen - fut_k).norm(p=2, dim=-1).mean(dim=(1, 2))  # (B,) detached — OK
+        loss_unc = (torch.exp(-ego_var) * norms + ego_var).mean()
 
-            loss = loss_dist * 50 + loss_unc
+        loss = loss_dist * 50 + loss_unc
 
         optimizer.zero_grad()
         loss.backward()
@@ -269,6 +267,7 @@ def validate(model_initializer, model_denoiser, loader, diffusion, cfg, device):
             B, traj_mask, past_traj, fut_traj, _ = data_preprocess(batch, device, cfg)
             ego_idx = torch.arange(B, device=device) * num_node
 
+            # Initializer (BF16 autocast)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
                 sample_pred, mean_est, var_est = model_initializer(past_traj, traj_mask)
                 sample_pred = (
@@ -277,17 +276,18 @@ def validate(model_initializer, model_denoiser, loader, diffusion, cfg, device):
                 )
                 loc = sample_pred + mean_est[:, None]
 
-                pred_traj = p_sample_loop_accelerate(
-                    model_denoiser, diffusion, past_traj, traj_mask, loc,
-                    num_tau=cfg.get('diffusion', {}).get('num_tau', 5),
-                )  # (B*num_node, K, T_F, 2)
+            # Denoiser inference: float32 (BF16+head_dim=256 Flash Attn 오류 방지)
+            pred_traj = p_sample_loop_accelerate(
+                model_denoiser, diffusion, past_traj, traj_mask, loc.float(),
+                num_tau=cfg.get('diffusion', {}).get('num_tau', 5),
+            )  # (B*num_node, K, T_F, 2)
 
-                ego_pred  = pred_traj[ego_idx]                                           # (B, K, T_F, 2)
-                fut_k     = fut_traj.unsqueeze(1).expand_as(ego_pred)                   # (B, K, T_F, 2)
-                distances = torch.norm(fut_k - ego_pred, dim=-1)        # (B, K, T_F)
+            ego_pred  = pred_traj[ego_idx]                          # (B, K, T_F, 2)
+            fut_k     = fut_traj.unsqueeze(1).expand_as(ego_pred)   # (B, K, T_F, 2)
+            distances = torch.norm(fut_k - ego_pred, dim=-1)        # (B, K, T_F)
 
-            ade_sum  += distances.float().mean(dim=-1).min(dim=-1)[0].sum().item()
-            fde_sum  += distances.float()[:, :, -1].min(dim=-1)[0].sum().item()
+            ade_sum  += distances.mean(dim=-1).min(dim=-1)[0].sum().item()
+            fde_sum  += distances[:, :, -1].min(dim=-1)[0].sum().item()
             samples  += B
 
             pbar.set_postfix(ADE=f"{ade_sum / samples:.4f}")
