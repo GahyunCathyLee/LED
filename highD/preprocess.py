@@ -173,7 +173,7 @@ def process_wrapper(args_tuple):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--raw_dir", type=str, default="highD/raw")
+    parser.add_argument("--raw_dir", type=str, default="highD/data")
     parser.add_argument("--out_dir", type=str, default="highD")
     parser.add_argument("--experiment_mode", type=str, default="baseline", choices=EXPERIMENT_MODE_MAP.keys())
     parser.add_argument("--normalize_flip", action="store_true", default=True)

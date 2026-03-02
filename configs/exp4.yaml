@@ -1,0 +1,61 @@
+# =========================
+# EXPERIMENT SETTING
+# =========================
+exp:
+  feature_mode: 'exp4'   # highD/preprocess.py EXPERIMENT_MODE_MAP key
+  device: 'cuda:0'
+  seed: 42
+  exp_tag: 'exp4'
+
+# =========================
+# DATA PATHS & PARAMS
+# =========================
+data:
+  base_dir: 'highD'          # npz files at highD/<feature_mode>/{train,val,test}.npz
+  batch_size: 512
+  num_workers: 24
+  persistent_workers: True
+  history_frames: 15         # T_H = 3.0s @ 5Hz
+  future_frames: 25          # T_F = 5.0s @ 5Hz
+
+# =========================
+# MODEL PARAMS
+# =========================
+model:
+  num_node: 9                # 1 ego + 8 neighbors
+
+# =========================
+# TRAINING PARAMS
+# =========================
+train:
+  epochs: 100
+  lr: 0.0001
+  lr_min: 0.000001        # CosineAnnealingLR eta_min
+  weight_decay: 0.0001
+  ckpt_dir: 'ckpts'
+
+# =========================
+# STAGE 1 PARAMS (Denoiser pre-training)
+# 없으면 train 섹션을 그대로 사용 (300 epoch 돌게 됨 — 비권장)
+# =========================
+stage1:
+  epochs: 50
+  lr: 0.0001
+  weight_decay: 0.0
+
+# =========================
+# DIFFUSION PARAMS
+# =========================
+diffusion:
+  steps: 100
+  beta_schedule: 'linear'
+  beta_start: 0.00001
+  beta_end: 0.02
+  num_tau: 3             # Stage 2 역방향 diffusion step 수 (논문: τ)
+
+# =========================
+# PERFORMANCE OPTIONS
+# =========================
+use_amp: true            # BF16 autocast (A100 권장)
+compile: true            # torch.compile 사용 여부
+compile_mode: 'reduce-overhead'  # 'reduce-overhead' | 'max-autotune'
