@@ -1,4 +1,5 @@
 import argparse
+from csv import writer
 import os
 from unittest import loader
 import yaml
@@ -206,7 +207,7 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
     num_node = cfg['model']['num_node']
     use_amp = cfg.get('use_amp', True)
     
-    total_loss = 0.
+    total_loss = total_dist = total_unc = 0.
     pbar = tqdm(loader, desc=f'Train (GPU {local_rank})', disable=(local_rank != 0))
 
     for batch in pbar:
@@ -254,8 +255,12 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
         optimizer.step()
         
         total_loss += loss.item()
-
-    return total_loss / len(loader)
+        total_dist += loss_dist.item() * 50 # 가중치 50 포함
+        total_unc += loss_unc.item()
+    
+    n = len(loader)
+    
+    return total_loss / n, total_dist / n, total_unc / n
 
 
 def validate(model_initializer, model_denoiser, loader, diffusion, cfg, device):
@@ -352,7 +357,7 @@ def main():
 
     # ── Logging (Stage 1/2 공통 writer) ───────────────────────────────────────
     log_dir = Path('logs') / exp_tag / datetime.now().strftime('%m%d-%H%M')
-    writer  = SummaryWriter(log_dir=str(log_dir))
+    writer = SummaryWriter(log_dir=str(log_dir)) if local_rank == 0 else None
     print(f"TensorBoard log -> {log_dir}")
 
     # ── Data (Stage 1/2 공통 loader) ──────────────────────────────────────────
@@ -406,15 +411,18 @@ def main():
     print(f"\n{'=' * 20}  Stage 2: Initializer Training  {'=' * 20}\n")
     epochs = cfg['train']['epochs']
     for epoch in range(start_epoch, epochs + 1):
-        print(f"{'=' * 30}  Epoch {epoch}/{epochs}  {'=' * 30}")
+        if local_rank == 0:
+            print(f"{'=' * 30}  Epoch {epoch}/{epochs}  {'=' * 30}")
 
-        avg_loss = train_epoch(
+        avg_loss, avg_dist, avg_unc = train_epoch(
             model_initializer, model_denoiser, train_loader,
             optimizer, diffusion, temporal_reweight, cfg, device, local_rank, epoch
         )
+        
         scheduler.step()
         
         if local_rank == 0:  # DDP에서는 rank 0만 검증 및 체크포인트 저장
+            print(f"{'=' * 30}  Epoch {epoch}/{epochs}  {'=' * 30}")
             val_ade, val_fde = validate(
                 model_initializer, model_denoiser, val_loader, diffusion, cfg, device,
             )
@@ -425,10 +433,19 @@ def main():
                 f"Val ADE {val_ade:.4f} | Val FDE {val_fde:.4f}"
             )
 
-            writer.add_scalar('Loss/train',       avg_loss, epoch)
-            writer.add_scalar('Val/ADE',          val_ade,    epoch)
-            writer.add_scalar('Val/FDE',          val_fde,    epoch)
+            writer.add_scalar('Loss/total', avg_loss, epoch)
+            writer.add_scalar('Loss/dist',  avg_dist, epoch)
+            writer.add_scalar('Loss/unc',   avg_unc, epoch)
+            
+            writer.add_scalar('Val/ADE',    val_ade,  epoch)
+            writer.add_scalar('Val/FDE',    val_fde,  epoch)
             writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+            
+            print(
+                f"Epoch {epoch:3d} | "
+                f"Loss {avg_loss:.4f} (dist={avg_dist:.4f}, unc={avg_unc:.4f}) | "
+                f"Val ADE {val_ade:.4f}"
+            )
 
             if val_ade < best_val_ade:
                 best_val_ade = val_ade
