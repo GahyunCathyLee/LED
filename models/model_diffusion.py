@@ -1,7 +1,12 @@
-import math
-import torch
-import torch.nn as nn
-from torch.nn import Module, Linear
+"""
+DEPRECATED — 이 파일은 더 이상 사용되지 않습니다.
+모든 Diffusion/Denoiser 로직은 models/denoiser.py 로 이전되었습니다.
+실수로 import하지 않도록 주의하세요.
+"""
+raise ImportError(
+    "models.model_diffusion is DEPRECATED. "
+    "Use models.denoiser instead."
+)
 
 from models.layers import PositionalEncoding, ConcatSquashLinear
 

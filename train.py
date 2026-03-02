@@ -12,10 +12,13 @@ from torch.utils.data import DataLoader
 import random
 
 from models.model_led_initializer import LEDInitializer
-from models.model_diffusion import TransformerDenoisingModel
+from models.denoiser import (
+    TransformerDenoisingModel,
+    setup_diffusion,
+    noise_estimation_loss,
+    p_sample_loop_accelerate,
+)
 from highD.dataset import HighDDataset
-
-NUM_TAU = 5  # accelerated diffusion sampling steps
 
 
 # ==============================================================================
@@ -81,73 +84,83 @@ def data_preprocess(batch, device, cfg):
     return B, traj_mask, past_traj_flat, fut_traj, initial_pos
 
 
+
 # ==============================================================================
-# Diffusion utilities
+# Stage 1: Denoiser 사전 학습
 # ==============================================================================
 
-def make_beta_schedule(schedule='linear', n_timesteps=100, start=1e-5, end=1e-2):
-    if schedule == 'linear':
-        betas = torch.linspace(start, end, n_timesteps)
-    elif schedule == 'quad':
-        betas = torch.linspace(start ** 0.5, end ** 0.5, n_timesteps) ** 2
-    elif schedule == 'sigmoid':
-        betas = torch.linspace(-6, 6, n_timesteps)
-        betas = torch.sigmoid(betas) * (end - start) + start
-    return betas
-
-
-def setup_diffusion(cfg, device):
-    diff_cfg = cfg.get('diffusion', {})
-    n_steps  = diff_cfg.get('steps', 100)
-    betas    = make_beta_schedule(
-        schedule=diff_cfg.get('beta_schedule', 'linear'),
-        n_timesteps=n_steps,
-        start=diff_cfg.get('beta_start', 1e-5),
-        end=diff_cfg.get('beta_end',   1e-2),
-    ).to(device)
-    alphas      = 1 - betas
-    alphas_prod = torch.cumprod(alphas, 0)
-    return {
-        'n_steps':                  n_steps,
-        'betas':                    betas,
-        'alphas':                   alphas,
-        'alphas_bar_sqrt':          torch.sqrt(alphas_prod),
-        'one_minus_alphas_bar_sqrt': torch.sqrt(1 - alphas_prod),
-    }
-
-
-def _extract(values, t, x):
-    """Gather diffusion coefficients at timestep t and reshape for broadcasting."""
-    out = torch.gather(values, 0, t.to(values.device))
-    return out.reshape([t.shape[0]] + [1] * (len(x.shape) - 1))
-
-
-def _p_sample_accelerate(model_denoiser, diffusion, x, mask, cur_y, t):
-    """Single reverse-diffusion step (accelerated, very small noise)."""
-    t_tensor  = torch.tensor([t], device=x.device)
-    eps_factor = (
-        (1 - _extract(diffusion['alphas'], t_tensor, cur_y))
-        / _extract(diffusion['one_minus_alphas_bar_sqrt'], t_tensor, cur_y)
-    )
-    beta      = _extract(diffusion['betas'], t_tensor.repeat(x.shape[0]), cur_y)
-    eps_theta = model_denoiser.generate_accelerate(cur_y, beta, x, mask)
-    mean      = (
-        (1 / _extract(diffusion['alphas'], t_tensor, cur_y).sqrt())
-        * (cur_y - eps_factor * eps_theta)
-    )
-    sigma_t = _extract(diffusion['betas'], t_tensor, cur_y).sqrt()
-    return mean + sigma_t * torch.randn_like(cur_y) * 0.00001
-
-
-def _p_sample_loop_accelerate(model_denoiser, diffusion, x, mask, loc):
+def run_stage1(model_denoiser, train_loader, val_loader,
+               diffusion, cfg, device, denoiser_ckpt_path, writer):
     """
-    20개의 예측 샘플 전체를 한 번에 병렬로 샘플링하여 속도를 높입니다.
+    논문 Section 4.4 Stage 1: L_NE = ||ε - f_ε(Y^(γ+1), context, γ+1)||²
+    denoiser_ckpt_path 가 없을 때만 호출됩니다.
+    학습이 끝나면 best checkpoint를 denoiser_ckpt_path 에 저장합니다.
     """
-    cur_y = loc[:, :20] # 20개 전체 선택
-    for i in reversed(range(NUM_TAU)):
-        # model_denoiser 내부의 generate_accelerate가 20개를 한 번에 처리합니다.
-        cur_y = _p_sample_accelerate(model_denoiser, diffusion, x, mask, cur_y, i)
-    return cur_y
+    s1 = cfg.get('stage1', cfg['train'])
+    epochs = s1.get('epochs', 100)
+
+    optimizer = optim.Adam(
+        model_denoiser.parameters(),
+        lr=s1.get('lr', 1e-4),
+        weight_decay=s1.get('weight_decay', 0.0),
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', patience=5, factor=0.5, min_lr=1e-6,
+    )
+
+    denoiser_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    best_val = float('inf')
+
+    use_amp = cfg.get('use_amp', True) and (device.type == 'cuda')
+
+    print(f"\n{'=' * 20}  Stage 1: Denoiser Pre-training  {'=' * 20}")
+    print(f"  epochs={epochs}  lr={optimizer.param_groups[0]['lr']:.2e}  BF16={use_amp}")
+    print(f"  checkpoint → {denoiser_ckpt_path}\n")
+
+    for epoch in range(1, epochs + 1):
+        # ── Train ──────────────────────────────────────────────────────────
+        model_denoiser.train()
+        total = 0.
+        pbar  = tqdm(train_loader, desc=f'[S1] Train', dynamic_ncols=True)
+        for batch in pbar:
+            B, traj_mask, past_traj, fut_traj, _ = data_preprocess(batch, device, cfg)
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                loss = noise_estimation_loss(model_denoiser, fut_traj, past_traj, traj_mask, diffusion)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model_denoiser.parameters(), 1.)
+            optimizer.step()
+            total += loss.item()
+            pbar.set_postfix(L=f"{loss.item():.4f}")
+        train_loss = total / len(train_loader)
+
+        # ── Validate ───────────────────────────────────────────────────────
+        model_denoiser.eval()
+        total = 0.
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f'[S1] Valid', dynamic_ncols=True):
+                B, traj_mask, past_traj, fut_traj, _ = data_preprocess(batch, device, cfg)
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                    total += noise_estimation_loss(
+                        model_denoiser, fut_traj, past_traj, traj_mask, diffusion
+                    ).item()
+        val_loss = total / len(val_loader)
+        scheduler.step(val_loss)
+
+        print(f"[S1] Epoch {epoch:3d}/{epochs} | Train {train_loss:.4f} | Val {val_loss:.4f}")
+        writer.add_scalar('Stage1/Loss/train', train_loss, epoch)
+        writer.add_scalar('Stage1/Loss/val',   val_loss,   epoch)
+
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save({
+                'epoch':               epoch,
+                'model_denoiser_dict': model_denoiser.state_dict(),
+                'val_loss':            val_loss,
+            }, denoiser_ckpt_path)
+            print(f"  >>> Best denoiser saved (val_loss={val_loss:.4f})")
+
+    print(f"\nStage 1 완료. Best val_loss={best_val:.4f}\n")
 
 
 # ==============================================================================
@@ -178,6 +191,7 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
     model_initializer.train()
     model_denoiser.eval()   # denoiser not updated; eval avoids stochastic dropout
     num_node = cfg['model']['num_node']
+    use_amp  = cfg.get('use_amp', True) and (device.type == 'cuda')
 
     total_loss = total_dist = total_unc = 0.
     pbar = tqdm(loader, desc='Train', dynamic_ncols=True)
@@ -188,38 +202,43 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
         # Ego node indices within the stacked (B*num_node) tensor: 0, 9, 18, ...
         ego_idx = torch.arange(B, device=device) * num_node
 
-        # ── Initializer ──────────────────────────────────────────────────────
-        sample_pred, mean_est, var_est = model_initializer(past_traj, traj_mask)
-        # sample_pred : (B*num_node, K=20, T_F, 2)
-        # mean_est    : (B*num_node, T_F, 2)
-        # var_est     : (B*num_node, 1)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+            # ── Initializer ──────────────────────────────────────────────────
+            sample_pred, mean_est, var_est = model_initializer(past_traj, traj_mask)
+            # sample_pred : (B*num_node, K=20, T_F, 2)
+            # mean_est    : (B*num_node, T_F, 2)
+            # var_est     : (B*num_node, 1)
 
-        sample_pred = (
-            torch.exp(var_est / 2)[..., None, None] * sample_pred
-            / sample_pred.std(dim=1).mean(dim=(1, 2))[:, None, None, None]
-        )
-        loc = sample_pred + mean_est[:, None]   # (B*num_node, K, T_F, 2)
-
-        # ── Accelerated diffusion sampling ────────────────────────────────────
-        with torch.no_grad(): # Denoiser 샘플링 시 gradient 계산 차단
-            generated_y = _p_sample_loop_accelerate(
-                model_denoiser, diffusion, past_traj, traj_mask, loc
+            sample_pred = (
+                torch.exp(var_est / 2)[..., None, None] * sample_pred
+                / sample_pred.std(dim=1).mean(dim=(1, 2))[:, None, None, None]
             )
+            loc = sample_pred + mean_est[:, None]   # (B*num_node, K, T_F, 2)
 
-        # ── Ego-only predictions ──────────────────────────────────────────────
-        ego_gen = generated_y[ego_idx]             # (B, K, T_F, 2)
-        ego_var = var_est[ego_idx].squeeze(-1)     # (B,)
-        fut_k   = fut_traj.unsqueeze(1)            # (B, 1, T_F, 2)
+            # ── Accelerated diffusion sampling (frozen denoiser) ──────────────
+            with torch.no_grad():
+                generated_y = p_sample_loop_accelerate(
+                    model_denoiser, diffusion, past_traj, traj_mask, loc,
+                    num_tau=cfg.get('diffusion', {}).get('num_tau', 5),
+                )
 
-        # ── Loss ─────────────────────────────────────────────────────────────
-        loss_dist = (
-            (ego_gen - fut_k).norm(p=2, dim=-1) * temporal_reweight
-        ).mean(dim=-1).min(dim=1)[0].mean()
+            # ── Ego-only predictions ──────────────────────────────────────────
+            ego_loc = loc[ego_idx]                     # (B, K, T_F, 2) — gradient 있음
+            ego_gen = generated_y[ego_idx]             # (B, K, T_F, 2) — uncertainty 보정용
+            ego_var = var_est[ego_idx].squeeze(-1)     # (B,)
+            fut_k   = fut_traj.unsqueeze(1)            # (B, 1, T_F, 2)
 
-        norms    = (ego_gen - fut_k).norm(p=2, dim=-1).mean(dim=(1, 2))  # (B,)
-        loss_unc = (torch.exp(-ego_var) * norms + ego_var).mean()
+            # ── Loss ─────────────────────────────────────────────────────────
+            # [버그 수정] ego_loc(loc 기반) 으로 계산해야 model_initializer까지 gradient 전달됨.
+            # ego_gen(generated_y 기반)은 no_grad 내부에서 만들어져 gradient가 없음.
+            loss_dist = (
+                (ego_loc - fut_k).norm(p=2, dim=-1) * temporal_reweight
+            ).mean(dim=-1).min(dim=1)[0].mean()
 
-        loss = loss_dist * 50 + loss_unc
+            norms    = (ego_gen - fut_k).norm(p=2, dim=-1).mean(dim=(1, 2))  # (B,) detached — OK
+            loss_unc = (torch.exp(-ego_var) * norms + ego_var).mean()
+
+            loss = loss_dist * 50 + loss_unc
 
         optimizer.zero_grad()
         loss.backward()
@@ -239,6 +258,7 @@ def validate(model_initializer, model_denoiser, loader, diffusion, cfg, device):
     model_initializer.eval()
     model_denoiser.eval()
     num_node = cfg['model']['num_node']
+    use_amp  = cfg.get('use_amp', True) and (device.type == 'cuda')
 
     ade_sum = fde_sum = 0.
     samples = 0
@@ -249,23 +269,25 @@ def validate(model_initializer, model_denoiser, loader, diffusion, cfg, device):
             B, traj_mask, past_traj, fut_traj, _ = data_preprocess(batch, device, cfg)
             ego_idx = torch.arange(B, device=device) * num_node
 
-            sample_pred, mean_est, var_est = model_initializer(past_traj, traj_mask)
-            sample_pred = (
-                torch.exp(var_est / 2)[..., None, None] * sample_pred
-                / sample_pred.std(dim=1).mean(dim=(1, 2))[:, None, None, None]
-            )
-            loc = sample_pred + mean_est[:, None]
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                sample_pred, mean_est, var_est = model_initializer(past_traj, traj_mask)
+                sample_pred = (
+                    torch.exp(var_est / 2)[..., None, None] * sample_pred
+                    / sample_pred.std(dim=1).mean(dim=(1, 2))[:, None, None, None]
+                )
+                loc = sample_pred + mean_est[:, None]
 
-            pred_traj = _p_sample_loop_accelerate(
-                model_denoiser, diffusion, past_traj, traj_mask, loc
-            )  # (B*num_node, K, T_F, 2)
+                pred_traj = p_sample_loop_accelerate(
+                    model_denoiser, diffusion, past_traj, traj_mask, loc,
+                    num_tau=cfg.get('diffusion', {}).get('num_tau', 5),
+                )  # (B*num_node, K, T_F, 2)
 
-            ego_pred = pred_traj[ego_idx]                           # (B, K, T_F, 2)
-            fut_k    = fut_traj.unsqueeze(1).repeat(1, 20, 1, 1)   # (B, K, T_F, 2)
+                ego_pred  = pred_traj[ego_idx]                                           # (B, K, T_F, 2)
+                fut_k     = fut_traj.unsqueeze(1).expand_as(ego_pred)                   # (B, K, T_F, 2)
+                distances = torch.norm(fut_k - ego_pred, dim=-1)        # (B, K, T_F)
 
-            distances = torch.norm(fut_k - ego_pred, dim=-1)       # (B, K, T_F)
-            ade_sum  += distances.mean(dim=-1).min(dim=-1)[0].sum().item()
-            fde_sum  += distances[:, :, -1].min(dim=-1)[0].sum().item()
+            ade_sum  += distances.float().mean(dim=-1).min(dim=-1)[0].sum().item()
+            fde_sum  += distances.float()[:, :, -1].min(dim=-1)[0].sum().item()
             samples  += B
 
             pbar.set_postfix(ADE=f"{ade_sum / samples:.4f}")
@@ -289,23 +311,60 @@ def main():
     torch.set_float32_matmul_precision('high')
 
     feature_mode = cfg['exp']['feature_mode']
+    exp_tag      = cfg['exp'].get('exp_tag', feature_mode)
     T_H = cfg['data']['history_frames']
     T_F = cfg['data']['future_frames']
 
-    ckpt_dir  = Path(cfg['train']['ckpt_dir']) / feature_mode
+    # ── Checkpoint 경로 (exp_tag 하위로 통일) ─────────────────────────────────
+    ckpt_dir        = Path(cfg['train']['ckpt_dir']) / exp_tag
+    denoiser_ckpt   = ckpt_dir / 'denoiser' / 'best.pt'
+    best_path       = ckpt_dir / 'best.pt'
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_path = ckpt_dir / 'best.pt'
 
-    print("=" * 50)
-    print(f"  Experiment : {feature_mode}")
+    print("=" * 55)
+    print(f"  Experiment : {feature_mode}  (tag: {exp_tag})")
     print(f"  T_H={T_H}  T_F={T_F}  Device={device}")
-    print("=" * 50)
+    print(f"  Checkpoint dir: {ckpt_dir}")
+    print("=" * 55)
 
     # ── Models ────────────────────────────────────────────────────────────────
     model_initializer = LEDInitializer(
         t_h=T_H, d_h=6, t_f=T_F, d_f=2, k_pred=20
     ).to(device)
     model_denoiser = TransformerDenoisingModel(t_h=T_H, d_h=6).to(device)
+
+    # ── Diffusion setup (Stage 1/2 공통) ──────────────────────────────────────
+    diffusion = setup_diffusion(cfg, device)
+
+    # ── Logging (Stage 1/2 공통 writer) ───────────────────────────────────────
+    log_dir = Path('logs') / exp_tag / datetime.now().strftime('%m%d-%H%M')
+    writer  = SummaryWriter(log_dir=str(log_dir))
+    print(f"TensorBoard log -> {log_dir}")
+
+    # ── Data (Stage 1/2 공통 loader) ──────────────────────────────────────────
+    train_loader = get_dataloader(cfg, 'train')
+    val_loader   = get_dataloader(cfg, 'val')
+    print(f"Train: {len(train_loader.dataset):,}  /  Val: {len(val_loader.dataset):,}\n")
+
+    # ── Stage 1: Denoiser 사전 학습 (checkpoint 없을 때만 실행) ───────────────
+    if not denoiser_ckpt.exists():
+        run_stage1(model_denoiser, train_loader, val_loader,
+                   diffusion, cfg, device, denoiser_ckpt, writer)
+
+    ckpt = torch.load(denoiser_ckpt, map_location=device)
+    model_denoiser.load_state_dict(ckpt['model_denoiser_dict'])
+    print(f"Denoiser loaded: {denoiser_ckpt}  (epoch {ckpt['epoch']}, val_loss {ckpt['val_loss']:.4f})")
+
+    # Denoiser는 Stage 2에서 완전히 frozen
+    model_denoiser.eval()
+    for p in model_denoiser.parameters():
+        p.requires_grad_(False)
+
+    # ── Stage 2 준비 ──────────────────────────────────────────────────────────
+    temporal_reweight = (
+        torch.FloatTensor([(T_F + 1 - i) for i in range(1, T_F + 1)])
+        .to(device).view(1, 1, -1) / 10
+    )
 
     optimizer = optim.AdamW(
         model_initializer.parameters(),
@@ -318,32 +377,18 @@ def main():
         eta_min=cfg['train'].get('lr_min', 1e-6),
     )
 
-    # ── Diffusion setup ───────────────────────────────────────────────────────
-    diffusion = setup_diffusion(cfg, device)
-    temporal_reweight = (
-        torch.FloatTensor([(T_F + 1 - i) for i in range(1, T_F + 1)])
-        .to(device).view(1, 1, -1) / 10
-    )
-
     start_epoch  = 1
     best_val_ade = float('inf')
 
     count_parameters(model_initializer, model_denoiser)
 
     if cfg.get('compile', True) and hasattr(torch, 'compile'):
-        model_initializer = torch.compile(model_initializer)
-        model_denoiser    = torch.compile(model_denoiser)
+        compile_mode      = cfg.get('compile_mode', 'reduce-overhead')
+        model_initializer = torch.compile(model_initializer, mode=compile_mode)
+        model_denoiser    = torch.compile(model_denoiser,    mode=compile_mode)
 
-    # ── Logging & data ────────────────────────────────────────────────────────
-    log_dir = Path('logs') / feature_mode / datetime.now().strftime('%m%d-%H%M')
-    writer  = SummaryWriter(log_dir=str(log_dir))
-    print(f"TensorBoard log -> {log_dir}")
-
-    train_loader = get_dataloader(cfg, 'train')
-    val_loader   = get_dataloader(cfg, 'val')
-    print(f"Train: {len(train_loader.dataset):,}  /  Val: {len(val_loader.dataset):,}\n")
-
-    # ── Training loop ─────────────────────────────────────────────────────────
+    # ── Stage 2 Training loop ─────────────────────────────────────────────────
+    print(f"\n{'=' * 20}  Stage 2: Initializer Training  {'=' * 20}\n")
     epochs = cfg['train']['epochs']
     for epoch in range(start_epoch, epochs + 1):
         print(f"{'=' * 30}  Epoch {epoch}/{epochs}  {'=' * 30}")
