@@ -10,6 +10,7 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 import random
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from models.model_led_initializer import LEDInitializer
 from models.denoiser import (
@@ -74,15 +75,11 @@ def data_preprocess(batch, device, cfg):
     N = past_traj.shape[1] # 9
     T_H = cfg['data']['history_frames']
 
-    # 1. 모델 입력을 위해 (B*N, T_H, 6) 형태로 변환
     past_traj_flat = past_traj.reshape(-1, T_H, 6)
 
-    # 2. [핵심] 2D 마스크 사용: (9, 9) 크기로 생성하면 모든 헤드/배치에 자동 적용됩니다.
-    # 3D 마스크 규격 에러를 원천 차단하고 연산량을 줄입니다.
     traj_mask = torch.ones((N, N), device=device) 
 
     return B, traj_mask, past_traj_flat, fut_traj, initial_pos
-
 
 
 # ==============================================================================
@@ -215,11 +212,12 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
             loc = sample_pred + mean_est[:, None]   # (B*num_node, K, T_F, 2)
 
         # ── Denoiser inference: frozen → float32 (BF16+head_dim=256 Flash Attn 오류 방지)
-        with torch.no_grad():
-            generated_y = p_sample_loop_accelerate(
-                model_denoiser, diffusion, past_traj, traj_mask, loc.detach().float(),
-                num_tau=cfg.get('diffusion', {}).get('num_tau', 5),
-            )
+        with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+            with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                generated_y = p_sample_loop_accelerate(
+                    model_denoiser, diffusion, past_traj, traj_mask, loc.detach(), 
+                    num_tau=cfg.get('diffusion', {}).get('num_tau', 5),
+                )
 
         # ── Ego-only predictions & Loss ──────────────────────────────────────
         ego_loc = loc[ego_idx]                     # (B, K, T_F, 2) — BF16, gradient 있음
@@ -227,8 +225,6 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
         ego_var = var_est[ego_idx].squeeze(-1)     # (B,) — BF16
         fut_k   = fut_traj.unsqueeze(1)            # (B, 1, T_F, 2)
 
-        # [버그 수정] ego_loc(loc 기반) 으로 계산해야 model_initializer까지 gradient 전달됨.
-        # ego_gen(generated_y 기반)은 no_grad 내부에서 만들어져 gradient가 없음.
         loss_dist = (
             (ego_loc - fut_k).norm(p=2, dim=-1) * temporal_reweight
         ).mean(dim=-1).min(dim=1)[0].mean()
@@ -370,6 +366,7 @@ def main():
         model_initializer.parameters(),
         lr=cfg['train']['lr'],
         weight_decay=cfg['train']['weight_decay'],
+        fused=True
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,

@@ -1,21 +1,3 @@
-"""
-models/denoiser.py
-──────────────────
-Diffusion 관련 로직을 한 곳에 모읍니다.
-
-Stage 1  (Denoiser 사전 학습)
-  · make_beta_schedule / setup_diffusion   — diffusion schedule 생성
-  · q_sample                               — forward diffusion (noise 추가)
-  · noise_estimation_loss                  — L_NE 손실 계산
-  · TransformerDenoisingModel.forward()    — noise 예측 (ego trajectory 1개)
-
-Stage 2  (Initializer 학습 중 inference)
-  · p_sample_accelerate                    — 역방향 1-step
-  · p_sample_loop_accelerate               — 전체 τ-step 루프
-  · TransformerDenoisingModel.encode_context()      — context 인코딩 (1회만)
-  · TransformerDenoisingModel.generate_accelerate() — K 샘플 병렬 denoising
-"""
-
 import math
 import torch
 import torch.nn as nn
@@ -118,9 +100,6 @@ class TransformerDenoisingModel(nn.Module):
         past_traj: (B*N, T_H, 6)
         mask:      (N, N)  — 0/1 binary mask (not pre-filled)
         Returns:   (B*N, 1, 256)
-
-        [성능] Stage 2에서 diffusion loop 밖에서 1회만 호출하면
-               이전 코드 대비 τ배 계산량을 절약합니다.
         """
         mask_f = mask.float() \
             .masked_fill(mask == 0, float('-inf')) \
@@ -177,6 +156,8 @@ class TransformerDenoisingModel(nn.Module):
 
         beta     = beta.view(B_N, 1, 1)
         time_emb = torch.cat([beta, torch.sin(beta), torch.cos(beta)], dim=-1)  # (B*N, 1, 3)
+        time_emb = time_emb.to(context_emb.dtype)
+        
         ctx_emb  = torch.cat([time_emb, context_emb], dim=-1)                   # (B*N, 1, 259)
         ctx_emb  = ctx_emb.repeat(1, n_samples, 1).unsqueeze(2)                 # (B*N, K, 1, 259)
 
@@ -197,8 +178,6 @@ class TransformerDenoisingModel(nn.Module):
 
 def noise_estimation_loss(model, y_0, past_traj, mask, diffusion):
     """
-    논문 Eq. L_NE = ||ε - f_ε(Y^(γ+1), context, γ+1)||²
-
     y_0:       (B, T_F, 2)   — 깨끗한 ego 미래 경로
     past_traj: (B*N, T_H, 6)
     mask:      (N, N)
@@ -252,7 +231,6 @@ def p_sample_loop_accelerate(model, diffusion, past_traj, mask, loc, num_tau=5):
     loc:       (B*N, K, T_F, 2)  — Initializer 출력 (prior)
     Returns:   (B*N, K, T_F, 2)  — denoised 궤적
 
-    [핵심] context를 루프 밖에서 1회만 인코딩 → 기존 대비 τ배 빠름.
     """
     context_emb = model.encode_context(past_traj, mask)  # (B*N, 1, 256)
 

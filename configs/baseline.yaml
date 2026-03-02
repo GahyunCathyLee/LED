@@ -12,8 +12,8 @@ exp:
 # =========================
 data:
   base_dir: 'highD'          # npz files at highD/<feature_mode>/{train,val,test}.npz
-  batch_size: 64
-  num_workers: 4
+  batch_size: 512
+  num_workers: 8
   persistent_workers: True
   history_frames: 15         # T_H = 3.0s @ 5Hz
   future_frames: 25          # T_F = 5.0s @ 5Hz
@@ -51,7 +51,7 @@ diffusion:
   beta_schedule: 'linear'
   beta_start: 0.00001
   beta_end: 0.02
-  num_tau: 5             # Stage 2 역방향 diffusion step 수 (논문: τ)
+  num_tau: 3             # Stage 2 역방향 diffusion step 수 (논문: τ)
 
 # =========================
 # PERFORMANCE OPTIONS
