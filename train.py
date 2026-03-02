@@ -1,7 +1,9 @@
 import argparse
 import os
+from unittest import loader
 import yaml
 import numpy as np
+from highD.preprocess import T_H
 import torch
 import torch.optim as optim
 from pathlib import Path
@@ -10,6 +12,10 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 import random
+from torch.nn.attention import SDPBackend, sdpa_kernel
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from models.model_led_initializer import LEDInitializer
@@ -21,6 +27,12 @@ from models.denoiser import (
 )
 from highD.dataset import HighDDataset
 
+def setup_ddp():
+    """DDP 환경 초기화"""
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
 
 # ==============================================================================
 # Config & Seed
@@ -44,23 +56,23 @@ def seed_everything(seed):
 # Data
 # ==============================================================================
 
-def get_dataloader(cfg, split='train'):
+def get_dataloader(cfg, split='train', is_ddp=True):
     data_path = (
         Path(cfg['data']['base_dir']) / cfg['exp']['feature_mode'] / f"{split}.npz"
     )
     dataset = HighDDataset(data_path)
-    num_workers = cfg['data']['num_workers']
-    shuffle = (split == 'train')
+    
+    sampler = DistributedSampler(dataset) if is_ddp else None
 
     loader_kwargs = dict(
         batch_size=cfg['data']['batch_size'],
-        shuffle=shuffle,
-        num_workers=num_workers,
+        shuffle=(sampler is None and split == 'train'),
+        num_workers=cfg['data']['num_workers'],
         pin_memory=True,
+        sampler=sampler,
+        prefetch_factor=4,
+        persistent_workers=True
     )
-    if num_workers > 0:
-        loader_kwargs['persistent_workers'] = cfg['data'].get('persistent_workers', True)
-        loader_kwargs['prefetch_factor'] = 4
 
     print(f"  [{split}] Loading from {data_path} ...")
     return DataLoader(dataset, **loader_kwargs)
@@ -183,23 +195,25 @@ def count_parameters(model_initializer, model_denoiser):
 # Train / Validate
 # ==============================================================================
 
-def train_epoch(model_initializer, model_denoiser, loader, optimizer,
-                diffusion, temporal_reweight, cfg, device):
+def train_epoch(model_initializer, model_denoiser, loader, optimizer, 
+                diffusion, temporal_reweight, cfg, device, local_rank, epoch):
     model_initializer.train()
-    model_denoiser.eval()   # denoiser not updated; eval avoids stochastic dropout
+    model_denoiser.eval()
+    
+    # DDP 환경에서 epoch마다 셔플링이 잘 되도록 설정
+    loader.sampler.set_epoch(epoch)
+    
     num_node = cfg['model']['num_node']
-    use_amp  = cfg.get('use_amp', True) and (device.type == 'cuda')
-
-    total_loss = total_dist = total_unc = 0.
-    pbar = tqdm(loader, desc='Train', dynamic_ncols=True)
+    use_amp = cfg.get('use_amp', True)
+    
+    total_loss = 0.
+    pbar = tqdm(loader, desc=f'Train (GPU {local_rank})', disable=(local_rank != 0))
 
     for batch in pbar:
         B, traj_mask, past_traj, fut_traj, _ = data_preprocess(batch, device, cfg)
-
-        # Ego node indices within the stacked (B*num_node) tensor: 0, 9, 18, ...
         ego_idx = torch.arange(B, device=device) * num_node
 
-        # ── Initializer (BF16 autocast) ──────────────────────────────────────
+        # 1. Initializer (BF16 Autocast)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
             sample_pred, mean_est, var_est = model_initializer(past_traj, traj_mask)
             # sample_pred : (B*num_node, K=20, T_F, 2)
@@ -215,8 +229,8 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
         with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
             with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
                 generated_y = p_sample_loop_accelerate(
-                    model_denoiser, diffusion, past_traj, traj_mask, loc.detach(), 
-                    num_tau=cfg.get('diffusion', {}).get('num_tau', 5),
+                    model_denoiser, diffusion, past_traj, traj_mask, loc.detach(),
+                    num_tau=cfg.get('diffusion', {}).get('num_tau', 5) # 논문 권장 τ=5 [cite: 268]
                 )
 
         # ── Ego-only predictions & Loss ──────────────────────────────────────
@@ -234,18 +248,14 @@ def train_epoch(model_initializer, model_denoiser, loader, optimizer,
 
         loss = loss_dist * 50 + loss_unc
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model_initializer.parameters(), 1.)
         optimizer.step()
-
+        
         total_loss += loss.item()
-        total_dist += loss_dist.item() * 50
-        total_unc  += loss_unc.item()
-        pbar.set_postfix(L=f"{loss.item():.4f}", D=f"{loss_dist.item():.4f}")
 
-    n = len(loader)
-    return total_loss / n, total_dist / n, total_unc / n
+    return total_loss / len(loader)
 
 
 def validate(model_initializer, model_denoiser, loader, diffusion, cfg, device):
@@ -296,13 +306,17 @@ def validate(model_initializer, model_denoiser, loader, diffusion, cfg, device):
 # ==============================================================================
 
 def main():
+    # 1. DDP 설정
+    local_rank = setup_ddp()
+    device = torch.device(f"cuda:{local_rank}")
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to YAML config')
     args = parser.parse_args()
 
     cfg    = load_config(args.config)
     seed_everything(cfg['exp']['seed'])
-    device = torch.device(cfg['exp']['device'] if torch.cuda.is_available() else 'cpu')
+
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')
 
@@ -324,10 +338,10 @@ def main():
     print("=" * 55)
 
     # ── Models ────────────────────────────────────────────────────────────────
-    model_initializer = LEDInitializer(
-        t_h=T_H, d_h=6, t_f=T_F, d_f=2, k_pred=20
-    ).to(device)
+    model_initializer = LEDInitializer(t_h=T_H, d_h=6, t_f=T_F, d_f=2, k_pred=20).to(device)
     model_denoiser = TransformerDenoisingModel(t_h=T_H, d_h=6).to(device)
+    
+    model_initializer = DDP(model_initializer, device_ids=[local_rank])
 
     # ── Diffusion setup (Stage 1/2 공통) ──────────────────────────────────────
     diffusion = setup_diffusion(cfg, device)
@@ -338,8 +352,8 @@ def main():
     print(f"TensorBoard log -> {log_dir}")
 
     # ── Data (Stage 1/2 공통 loader) ──────────────────────────────────────────
-    train_loader = get_dataloader(cfg, 'train')
-    val_loader   = get_dataloader(cfg, 'val')
+    train_loader = get_dataloader(cfg, 'train', is_ddp=True)
+    val_loader = get_dataloader(cfg, 'val', is_ddp=False)
     print(f"Train: {len(train_loader.dataset):,}  /  Val: {len(val_loader.dataset):,}\n")
 
     # ── Stage 1: Denoiser 사전 학습 (checkpoint 없을 때만 실행) ───────────────
@@ -390,45 +404,46 @@ def main():
     for epoch in range(start_epoch, epochs + 1):
         print(f"{'=' * 30}  Epoch {epoch}/{epochs}  {'=' * 30}")
 
-        train_loss, dist_loss, unc_loss = train_epoch(
+        avg_loss = train_epoch(
             model_initializer, model_denoiser, train_loader,
-            optimizer, diffusion, temporal_reweight, cfg, device,
+            optimizer, diffusion, temporal_reweight, cfg, device, local_rank, epoch
         )
         scheduler.step()
-        val_ade, val_fde = validate(
-            model_initializer, model_denoiser, val_loader, diffusion, cfg, device,
-        )
+        
+        if local_rank == 0:  # DDP에서는 rank 0만 검증 및 체크포인트 저장
+            val_ade, val_fde = validate(
+                model_initializer, model_denoiser, val_loader, diffusion, cfg, device,
+            )
 
-        print(
-            f"Epoch {epoch:3d} | "
-            f"Loss {train_loss:.4f} (dist={dist_loss:.4f}, unc={unc_loss:.4f}) | "
-            f"Val ADE {val_ade:.4f} | Val FDE {val_fde:.4f}"
-        )
+            print(
+                f"Epoch {epoch:3d} | "
+                f"Loss {avg_loss:.4f} | "
+                f"Val ADE {val_ade:.4f} | Val FDE {val_fde:.4f}"
+            )
 
-        writer.add_scalar('Loss/train',       train_loss, epoch)
-        writer.add_scalar('Loss/dist',        dist_loss,  epoch)
-        writer.add_scalar('Loss/uncertainty', unc_loss,   epoch)
-        writer.add_scalar('Val/ADE',          val_ade,    epoch)
-        writer.add_scalar('Val/FDE',          val_fde,    epoch)
-        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+            writer.add_scalar('Loss/train',       avg_loss, epoch)
+            writer.add_scalar('Val/ADE',          val_ade,    epoch)
+            writer.add_scalar('Val/FDE',          val_fde,    epoch)
+            writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
 
-        if val_ade < best_val_ade:
-            best_val_ade = val_ade
-            torch.save({
-                'epoch':                  epoch,
-                'model_initializer_dict': model_initializer.state_dict(),
-                'optimizer_state_dict':   optimizer.state_dict(),
-                'scheduler_state_dict':   scheduler.state_dict(),
-                'val_ade':                val_ade,
-                'val_fde':                val_fde,
-                'feature_mode':           feature_mode,
-            }, best_path)
-            print(f"Best model saved to {best_path}  (ADE: {val_ade:.4f})")
+            if val_ade < best_val_ade:
+                best_val_ade = val_ade
+                torch.save({
+                    'epoch':                  epoch,
+                    'model_initializer_dict': model_initializer.state_dict(),
+                    'optimizer_state_dict':   optimizer.state_dict(),
+                    'scheduler_state_dict':   scheduler.state_dict(),
+                    'val_ade':                val_ade,
+                    'val_fde':                val_fde,
+                    'feature_mode':           feature_mode,
+                }, best_path)
+                print(f"Best model saved to {best_path}  (ADE: {val_ade:.4f})")
 
-        print("-" * 50)
-        print()
+            print("-" * 50)
+            print()
 
     writer.close()
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
